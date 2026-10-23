@@ -1,0 +1,183 @@
+# Experimental contract for the pre-authorisation acquisition study.
+# Treat this file as immutable once validation-based policy development begins.
+
+experiment:
+  name: adaptive_evidence_acquisition_paysim
+  seed: 20260924
+  positive_label: 1
+
+dataset:
+  name: PaySim
+  raw_path: data/PS_20174392719_1491204439457_log.csv
+  source_url: not_supplied_with_local_copy
+  version: local_copy_verified_2026-09-25
+  sha256: 16910f90577b0d981bf8ff289714510bb89bc71bff7d3f220f024e287e4eea6b
+  time_column: step
+  transaction_id_column: null  # PaySim has no native ID; ingestion will create a stable row ID.
+  origin_account_column: nameOrig
+  destination_account_column: nameDest
+  label_column: isFraud
+  expected_columns:
+    - step
+    - type
+    - amount
+    - nameOrig
+    - oldbalanceOrg
+    - newbalanceOrig
+    - nameDest
+    - oldbalanceDest
+    - newbalanceDest
+    - isFraud
+    - isFlaggedFraud
+
+# Frozen IID protocol. Assignment is stratified by fraud label to retain enough
+# positives in each partition, but labels are never model features. This study
+# therefore evaluates adaptive acquisition under an IID assumption, not
+# temporal generalisation or deployment drift. Transaction-time behavioural
+# profiles nonetheless remain strict-prior for every individual case.
+iid_split:
+  assignment_path: data/iid_split.sqlite
+  assignment_table: assignments
+  seed: 20260925
+  fractions: {train: 0.50, validation: 0.10, test: 0.40}
+  stratify_column: isFraud
+  history_features: permitted_only_when_computed_from_strictly_earlier_steps
+
+initial_evidence:
+  fields:
+    - type
+    - amount
+  exclude_identifiers: true
+
+investigation:
+  # Pre-authorisation contract: current post-transaction balances and all
+  # derived deltas are prohibited. Tools return strict-prior aggregates only.
+  impact_observation_scheme: operational
+  terminal_actions: [approve, flag, escalate]
+  # Merges exact depletion with low residual-balance cases so the classifier
+  # cannot use an equality-like signature from PaySim's balance mechanism.
+  tools: [destination_network, origin_impact, destination_impact, combined_impact]
+  action_preconditions:
+    combined_impact: [origin_impact, destination_impact]
+  cost_model:
+    local_latency_benchmark: results/benchmarks/preauth_layer_latency.json
+    normalized_units:
+      destination_network: 1.0
+      origin_impact: 5.0
+      destination_impact: 5.0
+      combined_impact: 0.25
+    interpretation: prototype_latency_and_predeclared_operational_scenario_are_reported_separately
+  service_adapter_contract:
+    private_lookup_key: case_id
+    outputs: strict_prior_summaries_and_fixed_impact_bands_only
+    statuses: [ok, case_not_found, precondition_failed, split_not_authorized, service_unavailable]
+    data_transfer_units:
+      initial_evidence: 2
+      destination_network: 9
+      origin_impact: 4
+      destination_impact: 4
+      combined_impact: 2
+  availability_rule: prior_step_strictly_less_than_current_step
+  prohibited: [newbalanceOrig, newbalanceDest, current_balance_delta, observed_post_transaction_state]
+
+multitool_screening:
+  # This validation-only screen decides whether these families have enough
+  # complementary signal to justify a multi-tool controller study.
+  candidate_tools: [destination_network, origin_impact, destination_impact, combined_impact]
+  selection_split: validation
+  final_test_access: prohibited_until_toolset_is_frozen
+
+evidence_ladder_ablation:
+  split: validation
+  cohort: {selection: routed_by_frozen_entry_gate, positive_cases: 100, negative_cases: 400, total_cases: 500}
+  source_trace: governed_full_evidence_path
+  stages:
+    - {name: transaction_only, evidence: [initial_evidence]}
+    - {name: destination_network, evidence: [initial_evidence, destination_network]}
+    - {name: origin_impact, evidence: [initial_evidence, destination_network, origin_impact]}
+    - {name: full_evidence, evidence: [initial_evidence, destination_network, origin_impact, destination_impact, combined_impact]}
+  report: [pr_auc, roc_auc, recall_at_80_90_95_precision, cumulative_cost, tool_calls, data_transfer_units, local_service_latency]
+  test_access: prohibited
+
+adaptive_agent:
+  role: stateful_cost_aware_investigation_controller
+  primary_policy: structured_reproducible_controller
+  actions: [stop, destination_network, origin_impact, destination_impact, combined_impact, escalate]
+  terminal_actions: [approve, flag, escalate]
+  llm_entry_gate:
+    score_state: initial_evidence
+    selection_objective: recall
+    recall_target: 0.80
+    selection_split: validation
+    threshold: 0.533566727121687
+    achieved_precision: 0.007583877920311653
+    achieved_recall: 0.8014616321559074
+    routed_case_rate: 0.13636385068391746
+    selection_report: results/validation/llm_entry_gate_threshold.json
+    status: frozen_for_orchestration_comparison
+  small_model_screen:
+    split: validation
+    primary_candidate: qwen3:4b
+    comparison_candidates: [smollm:360m, qwen:0.5b, cajina/gemma4_e2b-q4_k_s:v01, llama3.2:1b]
+    goal_profile: balanced
+    routed_cohort: {positive_cases: 100, negative_cases: 400, total_cases: 500}
+    fixed_across_models: [prompt, action_schema, scorer, gateway, budgets, cases, decoding]
+    report: [valid_action_rate, gateway_rejections, retries, stopping_depth, action_mix, cost, latency, score_cost_tradeoff]
+    test_access: prohibited
+  qwen_repeatability:
+    split: validation
+    model: qwen3:4b
+    goal_profile: balanced
+    cohort: {selection: strong_full_evidence_confidence_stratified, fraud_cases: 10, non_fraud_cases: 10, total_cases: 20}
+    rollouts: 50
+    decoding: {temperature: 0.0, seed: 20260924, seed_policy: fixed_across_rollouts}
+    report: [action_sequence_agreement, unique_sequences, cost_mean_sd, stopped_risk_mean_sd, valid_action_rate, gateway_rejections, retries, stopped_episode_rate]
+    test_access: prohibited
+  qwen_boundary_repeatability:
+    split: validation
+    model: qwen3:4b
+    goal_profile: balanced
+    cohort:
+      selection: nearest_opposite_action_by_risk_round_robin_across_gate_and_action
+      cases: 25
+      labels_used_for_selection: false
+      gates: [origin_gate, destination_gate]
+    rollouts: 50
+    decoding: {temperature: 0.0, seed: 20260924, seed_policy: fixed_across_rollouts}
+    report: [action_sequence_agreement, unique_sequences, cost_mean_sd, stopped_risk_mean_sd, valid_action_counts, action_rejections, retries, service_failures, stopped_episode_counts]
+    test_access: prohibited
+  cross_model_boundary_repeatability:
+    split: validation
+    models: [qwen3:4b, smollm:360m, qwen:0.5b, cajina/gemma4_e2b-q4_k_s:v01, llama3.2:1b]
+    goal_profile: balanced
+    shared_cohort:
+      source_model: qwen3:4b
+      selection: nearest_opposite_action_by_risk_round_robin_across_gate_and_action
+      cases: 25
+      labels_used_for_selection: false
+    rollouts_per_model: 25
+    decoding: {temperature: 0.0, seed: 20260924, seed_policy: fixed_across_rollouts}
+    paper_table: [valid_action_counts, action_rejections, initial_network_prompt_adherence]
+    retained_audit_metrics: [stopped_episode_counts, action_sequence_agreement, unique_sequences, cost_sd, stopped_risk_sd]
+    test_access: prohibited
+  development_split: validation
+  final_evaluation_split: test
+
+evaluation:
+  primary_metrics: [fraud_recall, precision, pr_auc, false_positive_rate]
+  cost_metrics: [mean_tool_calls, mean_evidence_cost, escalation_rate]
+  split_for_threshold_tuning: validation
+  final_evaluation_split: test
+
+instrumentation:
+  clock: perf_counter_ns
+  trace_per_case: true
+  stages:
+    - initial_evidence
+    - destination_network
+    - origin_impact
+    - destination_impact
+    - combined_impact
+    - classifier
+  benchmark_split: validation
+  cost_freeze_required_before_test: true
